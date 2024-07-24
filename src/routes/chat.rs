@@ -71,6 +71,10 @@ async fn chat_completions_stream(
 
         propagate_context(&mut request, &headers);
 
+        // add a start timer
+        let start = std::time::Instant::now();
+        let mut ttft = None;
+
         let mut stream = client
             .model_stream_infer(request)
             .await
@@ -93,13 +97,18 @@ async fn chat_completions_stream(
             let infer_response = response
                 .infer_response
                 .context("empty infer response received")?;
-            tracing::debug!("triton infer response: {:?}", infer_response);
+            // tracing::error!("triton infer response: {:?}", infer_response);
 
             let raw_content = infer_response.raw_output_contents[0].clone();
             let content = deserialize_bytes_tensor(raw_content)?.into_iter().collect::<String>();
-            tracing::debug!("deserialized triton infer response content: {:?}", content);
+            // tracing::error!("deserialized triton infer response content: {:?}", content);
 
             if !content.is_empty() {
+                // get ttft when it is the first response
+                if ttft.is_none() {
+                    ttft = Some(start.elapsed().as_secs_f64());
+                }
+
                 let response = ChatCompletionChunk {
                     id: id.clone(),
                     object: "text_completion".to_string(),
@@ -114,10 +123,12 @@ async fn chat_completions_stream(
                         },
                         finish_reason: None,
                     }],
+                    ttft,
                 };
                 yield Event::default().json_data(response).unwrap();
             }
         }
+        tracing::error!("ttft: {:?}", ttft);
         let response = ChatCompletionChunk {
             id,
             object: "text_completion".to_string(),
@@ -132,6 +143,7 @@ async fn chat_completions_stream(
                 },
                 finish_reason: Some(FinishReason::Stop),
             }],
+            ttft,
         };
         yield Event::default().json_data(response).unwrap();
 
@@ -161,6 +173,9 @@ async fn chat_completions(
 
     propagate_context(&mut request, &headers);
 
+    // add a start timer
+    let start = std::time::Instant::now();
+
     let mut stream = client
         .model_stream_infer(request)
         .await
@@ -187,6 +202,10 @@ async fn chat_completions(
 
         contents.push(content);
     }
+    let duration = start.elapsed();
+
+    // add a "real_inf_time" kv pairs in the body
+    let real_inf_time = duration.as_secs_f64();
 
     Ok(Json(ChatCompletion {
         id: format!("cmpl-{}", Uuid::new_v4()),
@@ -209,15 +228,19 @@ async fn chat_completions(
             completion_tokens: 0,
             total_tokens: 0,
         }),
+        real_inf_time,
     }))
 }
 
 fn build_triton_request(
-    request: ChatCompletionCreateParams,
+    mut request: ChatCompletionCreateParams,
     history_builder: &HistoryBuilder,
 ) -> anyhow::Result<ModelInferRequest> {
     let chat_history = history_builder.build_history(&request.messages)?;
     tracing::debug!("chat history after formatting: {}", chat_history);
+
+    // Force the request model name to be "ensemble"
+    request.model = "ensemble".to_string();
 
     let mut builder = Builder::new()
         .model_name(request.model)
@@ -383,6 +406,8 @@ struct ChatCompletion {
     choices: Vec<ChatCompletionChoice>,
     /// Usage statistics for the completion request.
     usage: Option<Usage>,
+    // real inf time
+    real_inf_time: f64,
 }
 
 #[derive(Serialize, Debug)]
@@ -441,6 +466,7 @@ struct ChatCompletionChunk {
     system_fingerprint: Option<String>,
     /// A list of chat completion choices. Can be more than one if n is greater than 1.
     choices: Vec<ChatCompletionChunkChoice>,
+    ttft: Option<f64>,
 }
 
 #[derive(Serialize, Debug)]
